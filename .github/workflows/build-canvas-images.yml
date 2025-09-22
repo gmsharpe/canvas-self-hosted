@@ -1,89 +1,118 @@
-name: Build Canvas Docker images
+name: Build & Push Canvas image to GHCR
 
-# run manually or on pushes to main (adjust branches as you need)
+# Trigger on push to main/master and manually from the UI
 on:
   push:
-    branches: [ main, master ]
+    branches:
+      - main
+      - master
   workflow_dispatch:
+    inputs:
+      canvas_lms_ref:
+        description: 'Ref (branch/tag/commit) for instrcture/canvas-lms'
+        required: true
+        default: 'd5a99e9294e374e83f41197adce94aedf394750f'
+      build_mode:
+        description: 'dockerfile (default) or compose'
+        required: true
+        default: 'dockerfile'
+      image_tag:
+        description: 'Image tag to use (defaults to run SHA)'
+        required: false
+        default: ''
+      run_smoke:
+        description: 'Run a quick smoke test after build (true/false)'
+        required: true
+        default: 'true'
+
+# Important: grant packages write permission so GITHUB_TOKEN can push to GHCR
+permissions:
+  contents: read
+  packages: write
 
 env:
-  # change these defaults if you want a different image name / tag scheme
   IMAGE_NAME: canvas-lms
-  IMAGE_TAG: ${{ github.sha }}
 
 jobs:
-  build:
+  build-and-push:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write  # needed if pushing to GHCR
-      id-token: write
-
     steps:
-      - name: Checkout canvas-self-hosted repo
+      - name: Checkout this repo (canvas-self-hosted)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Checkout canvas-lms at specific commit
-        # checkout the other repo into `canvas-lms/` directory
+      - name: Checkout instrcture/canvas-lms at chosen ref
         uses: actions/checkout@v4
         with:
           repository: 'instructure/canvas-lms'
-          ref: 'd5a99e9294e374e83f41197adce94aedf394750f' # the exact commit you specified
+          ref: ${{ github.event.inputs.canvas_lms_ref }}
           path: 'canvas-lms'
           fetch-depth: 1
 
-      - name: Set up QEMU (for multi-arch builds)
+      - name: Setup QEMU (multi-arch)
         uses: docker/setup-qemu-action@v2
 
-      - name: Set up Docker Buildx
+      - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
-        with:
-          buildkitd-flags: --debug
 
-      - name: Login to container registry (optional)
-        if: ${{ secrets.REGISTRY_USERNAME && secrets.REGISTRY_PASSWORD }}
+      - name: Determine image tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.image_tag }}" ] && [ "${{ github.event.inputs.image_tag }}" != "" ]; then
+            echo "tag=${{ github.event.inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to GitHub Container Registry (GHCR) using GITHUB_TOKEN
         uses: docker/login-action@v2
         with:
-          registry: ${{ secrets.REGISTRY_HOST || 'ghcr.io' }}
-          username: ${{ secrets.REGISTRY_USERNAME }}
-          password: ${{ secrets.REGISTRY_PASSWORD }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Prepare caches directory
-        run: |
-          mkdir -p ~/.cache/docker-buildx
+      - name: Prepare cache dir
+        run: mkdir -p ~/.cache/docker-buildx
 
-      - name: Build canvas-lms image (local build, optional push)
+      - name: Build & push (Dockerfile)
+        if: ${{ github.event.inputs.build_mode == 'dockerfile' }}
         uses: docker/build-push-action@v5
         with:
           context: ./canvas-lms
+          # adjust to whatever Dockerfile path you actually need
           file: ./canvas-lms/Dockerfile-production
-          # builder cache, speeds up subsequent builds
-          cache-from: type=local,src=~/.cache/docker-buildx
-          cache-to: type=local,dest=~/.cache/docker-buildx,new=true
-          # if you want to push to registry, set push: true and ensure login step above ran
-          push: ${{ secrets.PUSH_IMAGES == 'true' }}
-          # image name; default uses GHCR when you set registry in secrets, otherwise change here
+          push: true
           tags: |
-            ${{ secrets.REGISTRY_HOST || 'ghcr.io' }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-            ${{ secrets.REGISTRY_HOST || 'ghcr.io' }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
-          # Build args (common Canvas build variables — adjust to your needs)
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           build-args: |
             NODE_ENV=production
             RAILS_ENV=production
-            # If you need to skip npm install during asset compilation inside Dockerfile:
-            # COMPILE_ASSETS_NPM_INSTALL=0
 
-      - name: Output image info
+      - name: Build (docker compose)
+        if: ${{ github.event.inputs.build_mode == 'compose' }}
         run: |
-          echo "Built image tags:"
-          echo "${{ secrets.REGISTRY_HOST || 'ghcr.io' }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
-          echo "${{ secrets.REGISTRY_HOST || 'ghcr.io' }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest"
+          sudo apt-get update -y
+          sudo apt-get install -y docker-compose-plugin
+          # build all services declared in docker-compose.yml (adjust path if needed)
+          docker compose -f docker-compose.yml build --parallel
+          # After building with compose, you can tag & push service images explicitly if needed.
+          # E.g. docker tag <local-image> ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
+          #       docker push ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
 
-      - name: Optional: run smoke container (quick health check)
-        if: ${{ always() && inputs.RUN_SMOKE != 'false' }}
+      - name: Optional smoke test
+        if: ${{ github.event.inputs.run_smoke == 'true' }}
         run: |
-          # run briefly to ensure image can start (adjust command as appropriate for Canvas)
-          docker run --rm --entrypoint echo ${{ secrets.REGISTRY_HOST || 'ghcr.io' }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} "image built"
+          IMAGE=ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
+          echo "Running smoke check for $IMAGE"
+          # Quick check: print entrypoint (no containers started long-term)
+          docker run --rm --entrypoint echo $IMAGE "image-built"
 
+      - name: Output pushed image tags
+        run: |
+          echo "Pushed:"
+          echo "  ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}"
+          echo "  ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest"
