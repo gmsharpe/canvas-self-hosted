@@ -1,122 +1,59 @@
-name: Build & Push Canvas image to GHCR (no custom secrets)
+name: Build & Push Canvas Docker image
 
 on:
+  workflow_dispatch:   # run from the GitHub UI
   push:
     branches:
       - main
-      - master
-  workflow_dispatch:
-    inputs:
-      canvas_lms_ref:
-        description: 'Ref (branch/tag/commit) for instrcture/canvas-lms'
-        required: true
-        default: 'd5a99e9294e374e83f41197adce94aedf394750f'
-      build_mode:
-        description: 'dockerfile (default) or compose'
-        required: true
-        default: 'dockerfile'
-      image_tag:
-        description: 'Image tag to use (defaults to run SHA)'
-        required: false
-        default: ''
-      run_smoke:
-        description: 'Run a quick smoke test after build (true/false)'
-        required: true
-        default: 'true'
 
-# This is required so the workflow's GITHUB_TOKEN can push to GHCR
 permissions:
   contents: read
-  packages: write
-
-env:
-  IMAGE_NAME: canvas-lms
+  packages: write   # needed to push to GHCR
+  id-token: write   # not required for this flow, but common to include
 
 jobs:
-  build-and-push:
+  build:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout this repo (canvas-self-hosted)
+      - name: Checkout this repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # if your repo has submodules you can enable them:
+          submodules: 'recursive'
 
-      - name: Checkout instrcture/canvas-lms at chosen ref
+      - name: Checkout canvas-lms at specific commit into canvas-lms/
+        # checkout the external repository into path "canvas-lms"
         uses: actions/checkout@v4
         with:
-          repository: 'instructure/canvas-lms'
-          ref: ${{ github.event.inputs.canvas_lms_ref }}
-          path: 'canvas-lms'
-          fetch-depth: 1
+          repository: instructure/canvas-lms
+          ref: d5a99e9294e374e83f41197adce94aedf394750f  # the commit you specified
+          path: canvas-lms
+          fetch-depth: 0
 
-      # - name: Fix CRLF issues (optional — avoids ruby\r errors)
-      #   # If you know your repo has CRLF files use this; safe to keep
-      #   run: |
-      #     sudo apt-get update -y
-      #     sudo apt-get install -y dos2unix
-      #     find . -type f -name '*.sh' -print0 | xargs -0 -r dos2unix || true
-      #     find ./canvas-lms -type f -print0 | xargs -0 -r dos2unix || true
-
-      - name: Setup QEMU (multi-arch)
+      - name: Set up QEMU
         uses: docker/setup-qemu-action@v2
 
-      - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
 
-      - name: Determine image tag
-        id: tag
-        run: |
-          if [ -n "${{ github.event.inputs.image_tag }}" ] && [ "${{ github.event.inputs.image_tag }}" != "" ]; then
-            echo "tag=${{ github.event.inputs.image_tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Log in to GHCR using built-in GITHUB_TOKEN
+      - name: Log in to GitHub Container Registry (GHCR)
         uses: docker/login-action@v2
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Prepare cache dir
-        run: mkdir -p ~/.cache/docker-buildx
-
-      - name: Build & push (Dockerfile mode)
-        if: ${{ github.event.inputs.build_mode == 'dockerfile' }}
-        uses: docker/build-push-action@v5
-        with:
-          context: ./canvas-lms
-          # change if your Dockerfile filename/path is different
-          file: ./canvas-lms/Dockerfile-production
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
-            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          build-args: |
-            NODE_ENV=production
-            RAILS_ENV=production
-
-      - name: Build (docker-compose mode)
-        if: ${{ github.event.inputs.build_mode == 'compose' }}
+      - name: Build and push image (multi-platform)
+        # adjust platforms and tags as you want
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y docker-compose-plugin
-          docker compose -f docker-compose.yml build --parallel
-          # Note: docker compose build doesn't automatically tag/push the same way;
-          # you'd need to docker tag + docker push explicit images here.
-
-      - name: Optional smoke test
-        if: ${{ github.event.inputs.run_smoke == 'true' }}
-        run: |
-          IMAGE=ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
-          echo "Running smoke check for $IMAGE"
-          docker run --rm --entrypoint echo $IMAGE "image-built"
-
-      - name: Output pushed image tags
-        run: |
-          echo "Pushed:"
-          echo "  ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}"
-          echo "  ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest"
+          IMAGE=ghcr.io/${{ github.repository_owner }}/canvas-self-hosted:${{ github.sha }}
+          # If you prefer a 'latest' tag too, add -t ghcr.io/${{ github.repository_owner }}/canvas-self-hosted:latest
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --push \
+            --file canvas-lms/Dockerfile.production \
+            --tag "${IMAGE}" \
+            canvas-lms
+          echo "Pushed ${IMAGE}"
