@@ -1,6 +1,5 @@
-name: Build & Push Canvas image to GHCR
+name: Build & Push Canvas image to GHCR (no custom secrets)
 
-# Trigger on push to main/master and manually from the UI
 on:
   push:
     branches:
@@ -25,7 +24,7 @@ on:
         required: true
         default: 'true'
 
-# Important: grant packages write permission so GITHUB_TOKEN can push to GHCR
+# This is required so the workflow's GITHUB_TOKEN can push to GHCR
 permissions:
   contents: read
   packages: write
@@ -50,6 +49,14 @@ jobs:
           path: 'canvas-lms'
           fetch-depth: 1
 
+      # - name: Fix CRLF issues (optional — avoids ruby\r errors)
+      #   # If you know your repo has CRLF files use this; safe to keep
+      #   run: |
+      #     sudo apt-get update -y
+      #     sudo apt-get install -y dos2unix
+      #     find . -type f -name '*.sh' -print0 | xargs -0 -r dos2unix || true
+      #     find ./canvas-lms -type f -print0 | xargs -0 -r dos2unix || true
+
       - name: Setup QEMU (multi-arch)
         uses: docker/setup-qemu-action@v2
 
@@ -65,7 +72,7 @@ jobs:
             echo "tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Log in to GitHub Container Registry (GHCR) using GITHUB_TOKEN
+      - name: Log in to GHCR using built-in GITHUB_TOKEN
         uses: docker/login-action@v2
         with:
           registry: ghcr.io
@@ -75,12 +82,12 @@ jobs:
       - name: Prepare cache dir
         run: mkdir -p ~/.cache/docker-buildx
 
-      - name: Build & push (Dockerfile)
+      - name: Build & push (Dockerfile mode)
         if: ${{ github.event.inputs.build_mode == 'dockerfile' }}
         uses: docker/build-push-action@v5
         with:
           context: ./canvas-lms
-          # adjust to whatever Dockerfile path you actually need
+          # change if your Dockerfile filename/path is different
           file: ./canvas-lms/Dockerfile-production
           push: true
           tags: |
@@ -92,23 +99,20 @@ jobs:
             NODE_ENV=production
             RAILS_ENV=production
 
-      - name: Build (docker compose)
+      - name: Build (docker-compose mode)
         if: ${{ github.event.inputs.build_mode == 'compose' }}
         run: |
           sudo apt-get update -y
           sudo apt-get install -y docker-compose-plugin
-          # build all services declared in docker-compose.yml (adjust path if needed)
           docker compose -f docker-compose.yml build --parallel
-          # After building with compose, you can tag & push service images explicitly if needed.
-          # E.g. docker tag <local-image> ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
-          #       docker push ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
+          # Note: docker compose build doesn't automatically tag/push the same way;
+          # you'd need to docker tag + docker push explicit images here.
 
       - name: Optional smoke test
         if: ${{ github.event.inputs.run_smoke == 'true' }}
         run: |
           IMAGE=ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
           echo "Running smoke check for $IMAGE"
-          # Quick check: print entrypoint (no containers started long-term)
           docker run --rm --entrypoint echo $IMAGE "image-built"
 
       - name: Output pushed image tags
